@@ -1,59 +1,119 @@
-# MonoInjector
+<div align="center">
 
-A Windows DLL that injects .NET assemblies into processes using the Mono runtime (`mono-2.0-bdwgc.dll`). It hooks into the Mono JIT pipeline to load and execute managed code from an embedded byte buffer at runtime.
+# mono-runtime-injector
+
+![C](https://img.shields.io/badge/C-A8B9CC?style=flat-square&logo=c&logoColor=black)
+![C++](https://img.shields.io/badge/C++-00599C?style=flat-square&logo=cplusplus&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=flat-square&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
+
+**Windows DLL that injects .NET assemblies into Mono runtime processes.**
+
+Hooks into the Mono JIT pipeline to load and execute managed code from an embedded byte buffer at runtime using reconstructed internal functions, PEB module spoofing, and pattern-scanned method resolution.
+
+</div>
+
+---
+
+## Architecture
+
+```
+DllMain (DLL_PROCESS_ATTACH)
+   |
+   +-- CreateThread --> start()
+                          |
+                          +-- PEB walk: spoof module entry as ntdll.dll
+                          +-- MinHook: hook NtCreateFile (block file enumeration)
+                          +-- Locate mono-2.0-bdwgc.dll base address
+                          +-- JIT hook: patch PreloaderUI.Update call site
+                                |
+                                +-- PreloaderUIUpdate (payload)
+                                      |
+                                      +-- mono_image_open_from_data (embedded DLL buffer)
+                                      +-- mono_assembly_load_from
+                                      +-- mono_class_from_name --> MonoCheat.Entry
+                                      +-- mono_compile_method --> Entry.Init
+                                      +-- invoke Entry.Init()
+                                      +-- unhook and restore original
+```
 
 ## How It Works
 
-1. **DLL Entry** -- On `DLL_PROCESS_ATTACH`, a new thread is spawned to run the main injection logic.
+### 1. Module Spoofing
 
-2. **Module Spoofing** -- The injector walks the PEB loader data to locate its own module entry and overwrites the `BaseDllName`, `FullDllName`, `SigningLevel`, `LoadReason`, and other metadata to mimic `ntdll.dll`. This hides the injected DLL from basic module enumeration.
+On entry, the injector walks the PEB `InMemoryOrderModuleList` to find its own `LDR_DATA_TABLE_ENTRY`. It then copies metadata from `ntdll.dll`'s entry -- `SigningLevel`, `LoadReason`, `BaseNameHashValue`, `LoadTime`, `TimeDateStamp` -- and overwrites its own `BaseDllName` and `FullDllName` to point to `C:\Windows\System32\ntdll.dll`.
 
-3. **NtCreateFile Hook** -- Uses [MinHook](https://github.com/TsudaKageworthy/minhook) to hook `NtCreateFile`, blocking file access to the host image, `BugSplat64.dll`, and `ntdll.dll` by returning `STATUS_ACCESS_VIOLATION` for matching object names.
+### 2. NtCreateFile Hook
 
-4. **Mono JIT Hook** -- Locates the `PreloaderUI.Update` method via Mono's assembly/method descriptor APIs, then patches the JIT-compiled call site to redirect execution to the injector's payload function.
+Uses [MinHook](https://github.com/TsudaKageworthy/minhook) to intercept `NtCreateFile`. The hook checks `ObjectAttributes->ObjectName` and returns `STATUS_ACCESS_VIOLATION` for requests targeting the host executable, `BugSplat64.dll`, or `ntdll.dll` -- preventing file-based integrity checks from reading the original modules.
 
-5. **Assembly Loading** -- The payload function calls reconstructed Mono internals (`mono_image_open_from_data`, `mono_assembly_load_from`, `mono_compile_method`) using hardcoded offsets into the Mono module. It loads the embedded DLL buffer as a Mono image, resolves the `MonoCheat.Entry.Init` method, JIT-compiles it, and invokes it.
+### 3. Mono JIT Hooking
 
-6. **Cleanup** -- After the managed payload executes, the JIT hook is removed by restoring the original function pointer.
+The `JitHook` class in `HookLib.h`:
+
+1. Resolves the target method by name using `mono_method_desc_new` + `mono_method_desc_search_in_image`
+2. Finds the JIT-compiled code via pattern-scanned `mini_lookup_method`
+3. Locates the `call r11` instruction within the compiled method body
+4. Overwrites the 8-byte function pointer preceding it with the payload address
+
+### 4. Assembly Loading (Reconstructed Internals)
+
+Core Mono functions are **not called via exports**. Instead, they are reconstructed from reverse-engineered offsets into `mono-2.0-bdwgc.dll`:
+
+| Function | Purpose |
+|:---------|:--------|
+| `mono_image_open_from_data` | Load a PE image from a raw byte buffer |
+| `mono_assembly_load_from` | Create an assembly from a loaded image |
+| `mono_compile_method` | JIT-compile a method and return its native address |
+| `mono_error_cleanup` | Free Mono error state structures |
+| `free_base` | Heap free through Mono's internal allocator |
+
+### 5. Pattern Scanning
+
+`pattern.cpp` implements a byte pattern scanner supporting wildcards (`?`). Used to locate internal Mono functions by signature rather than hardcoded addresses, providing resilience across minor version changes.
 
 ## Project Structure
 
 ```
 MonoInjector/
-  dllmain.cpp            Main entry point, hooks, Mono function recreations
-  HookLib.h              JIT hook class, method resolution via pattern scanning
-  pattern.h / pattern.cpp  Byte pattern scanner for locating functions in memory
+  dllmain.cpp              Entry point, hooks, reconstructed Mono internals
+  HookLib.h                JIT hook class, method resolution, pattern-based lookup
+  pattern.h / pattern.cpp  Byte pattern scanner with wildcard support
   Utils/
     Utils.h/
-      Utils.h            Helper for calling Mono exports by name
-      lazy_import.h      Lazy import resolution (LI_FIND / LI_MODULE macros)
-      dll_buffer.h       Embedded .NET assembly as a byte array
+      Utils.h              Helper for calling Mono exports by name at runtime
+      lazy_import.h        Lazy import resolution (avoids static IAT entries)
+      dll_buffer.h         Embedded .NET assembly as a byte array
     Spoof Call/
-      Safe Call.h        Spoofed call helpers
-      SpoofCall.cpp      Spoof call implementation
-MonoInjector.sln         Visual Studio solution
+      Safe Call.h          Spoofed call frame helpers
+      SpoofCall.cpp        Implementation
+MonoInjector.sln           Visual Studio solution
 ```
 
 ## Building
 
 ### Requirements
 
-- Visual Studio 2019+ with the C++ desktop workload
-- Windows SDK
-- [MinHook](https://github.com/TsudaKageworthy/minhook) (linked as a dependency)
+- Visual Studio 2019+ with C++ desktop workload
+- Windows SDK (x64)
+- [MinHook](https://github.com/TsudaKageworthy/minhook)
 
 ### Steps
 
-1. Open `MonoInjector.sln` in Visual Studio.
-2. Ensure MinHook headers and library are available (add via NuGet or manually configure include/lib paths).
-3. Place your compiled .NET assembly bytes in `Utils/Utils.h/dll_buffer.h` as the `dll_array` byte array.
-4. Build the solution in **Release | x64**.
+1. Open `MonoInjector.sln` in Visual Studio
+2. Configure MinHook include/lib paths (NuGet or manual)
+3. Place your compiled .NET assembly bytes in `Utils/Utils.h/dll_buffer.h` as the `dll_array` byte array
+4. Build in **Release | x64**
 
-## Key Implementation Details
+## Key Techniques
 
-- **No exported Mono functions for core operations** -- `mono_image_open_from_data`, `mono_assembly_load_from`, and `mono_compile_method` are reconstructed from reverse-engineered Mono internals using hardcoded offsets. This avoids relying on exports that may be monitored.
-- **Pattern scanning** -- `HookLib.h` uses byte pattern signatures to locate Mono's JIT lookup functions at runtime, making the hook resilient to minor module rebases.
-- **Lazy imports** -- All Win32 API calls go through `LI_FIND` macros to avoid static import table entries.
+| Technique | Implementation |
+|:----------|:---------------|
+| **PEB spoofing** | Overwrites loader data to disguise module identity |
+| **Lazy imports** | All Win32 calls via `LI_FIND` macros -- no static IAT entries |
+| **Reconstructed internals** | Core Mono functions rebuilt from offsets, not called via exports |
+| **Pattern scanning** | Byte signatures with wildcards for resilient function location |
+| **JIT call-site patching** | Overwrites compiled method's indirect call target |
 
 ## Disclaimer
 
